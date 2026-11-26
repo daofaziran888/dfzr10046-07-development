@@ -59,15 +59,20 @@ class BaseModuleService:
         rows.append(entry)
         return entry, []
 
-    def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
+    def run_action(
+        self, entry_id: int, action: str, *,
+        remark: str | None = None,
+        actor: str | None = None,
+        target: str | None = None,
+    ) -> tuple[dict[str, Any] | None, str]:
         entry = store.find(self.MODULE, entry_id)
         if entry is None:
             return None, f"{self.ENTITY} {entry_id} 不存在或已归档"
-        target = self.ACTION_RULES.get(action)
-        if target is None:
+        target_status = self.ACTION_RULES.get(action)
+        if target_status is None:
             return None, f"动作「{action}」不属于{self.MODULE}可执行范围"
-        entry["status"] = target
-        entry["pending"] = target != self.STATUS_ORDER[-1]
+        entry["status"] = target_status
+        entry["pending"] = target_status != self.STATUS_ORDER[-1]
         entry["abnormal"] = action in self.NEGATIVE_ACTIONS
         return entry, f"{self.ENTITY}已{action}"
 

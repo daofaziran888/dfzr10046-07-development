@@ -10,7 +10,7 @@ from app.store import store
 class ReprocessTaskService(BaseModuleService):
     MODULE = "reprocess_task"
     ENTITY = "重跑任务"
-    LIST_FIELDS = ["重跑编号", "触发原因", "影响事实表", "重跑区间", "覆盖策略", "依赖批次", "重跑水位", "重跑耗时"]
+    LIST_FIELDS = ["重跑编号", "触发原因", "影响事实表", "重跑区间", "覆盖策略", "依赖批次", "重跑水位", "重跑耗时", "负责班次", "负责人", "来源交接单", "交接签收"]
     REQUIRED_FIELDS = ["重跑编号", "触发原因", "影响事实表"]
     STATUS_ORDER = ["待排期", "重跑中", "已完成", "重跑失败"]
     ACTION_RULES = {"排期重跑": "重跑中", "确认完成": "已完成", "标记失败": "重跑失败"}
@@ -62,3 +62,46 @@ class ReprocessTaskService(BaseModuleService):
                 r["pending"] = False
                 return True, f"重跑任务 {task_id} 已完成，水位 {watermark}"
         return False, f"重跑任务 {task_id} 不存在"
+
+    def run_action(
+        self, entry_id: int, action: str, *,
+        remark: str | None = None,
+        actor: str | None = None,
+        target: str | None = None,
+    ) -> tuple[dict[str, Any] | None, str]:
+        """排期重跑前校验排期权限：交接来源的任务须凭已签收交接单才可排期。"""
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return None, f"{self.ENTITY} {entry_id} 不存在或已归档"
+        if action not in self.ACTION_RULES:
+            return None, f"动作「{action}」不属于{self.MODULE}可执行范围"
+
+        handover_no = str(entry.get("来源交接单") or "")
+        granted = None
+        if action == "排期重跑" and handover_no:
+            actor = (actor or "").strip()
+            if not actor:
+                return None, (
+                    f"重跑任务 {entry.get('重跑编号')} 由交接单 {handover_no} 交入，"
+                    f"排期须注明凭交接签收的接班人"
+                )
+            from app.services.shift_handover import ShiftHandoverService
+            granted = ShiftHandoverService().schedule_grant(
+                str(entry.get("重跑编号")), actor)
+            if granted is None:
+                return None, (
+                    f"{actor} 未凭交接单 {handover_no} 的签收取得"
+                    f"重跑任务 {entry.get('重跑编号')} 的排期权限"
+                )
+            entry["排期依据"] = f"{granted.get('交接单号')}@{actor}"
+
+        entry["status"] = self.ACTION_RULES[action]
+        entry["pending"] = entry["status"] != self.STATUS_ORDER[-1]
+        entry["abnormal"] = action in self.NEGATIVE_ACTIONS
+        if action == "排期重跑":
+            operator = (actor or "").strip()
+            if operator and not str(entry.get("负责人") or "").strip():
+                entry["负责人"] = operator
+            if granted is not None and not str(entry.get("负责班次") or "").strip():
+                entry["负责班次"] = str(granted.get("接班班次") or "")
+        return entry, f"重跑任务已{action}"

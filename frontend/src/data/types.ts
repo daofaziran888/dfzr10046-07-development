@@ -18,7 +18,14 @@ export type ModuleMeta = {
   actions: string[]
   actionTargets: Record<string, string>
   metrics: string[]
+  /** 登记时真正必填的字段，缺省时按全部字段必填处理。 */
+  requiredFields?: string[]
+  /** 动作需要补充的上下文：actor=经手人，target=改派/指派目标。 */
+  actionFields?: Record<string, ('actor' | 'target')[]>
+  /** 统计卡第二、三项对应的状态；缺省沿用第二项与最后一项状态。 */
+  metricStatuses?: (string | null)[]
 }
+
 
 export type PageResult = {
   items: EntryRow[]

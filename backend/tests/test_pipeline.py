@@ -806,3 +806,262 @@ class TestDataEdgeCases:
         report = orch.status_report()
         for key in ["audit_log", "watermark", "scd", "fact", "quality", "reprocess", "snapshot"]:
             assert key in report, f"Missing key {key} in status_report"
+
+class TestShiftHandover:
+    """值班交接：签收结论同步重跑待办、凭交接取排期权限、并发处分幂等。"""
+
+    _seq = 0
+
+    def _new_task(self, status="待排期", owner=""):
+        from app.store import store
+        TestShiftHandover._seq += 1
+        seq = TestShiftHandover._seq
+        task = {
+            "id": max((int(r.get("id", 0)) for r in store.rows("reprocess_task")), default=0) + 1,
+            "重跑编号": f"RP-T-{seq}", "触发原因": "迟到事实回补",
+            "影响事实表": "销售事实表", "重跑区间": "2026-09-20至2026-09-30",
+            "覆盖策略": "整段替换", "依赖批次": "FACT-B002",
+            "重跑水位": "", "重跑耗时": "",
+            "status": status, "pending": status == "待排期", "abnormal": False,
+            "负责班次": "夜班 2026-11-25 20:00-次日08:00" if owner else "",
+            "负责人": owner,
+            "来源交接单": "", "交接签收": "",
+        }
+        store.rows("reprocess_task").append(task)
+        return task
+
+    def _new_ticket(self, task, **overrides):
+        from app.services.shift_handover import ShiftHandoverService
+        TestShiftHandover._seq += 1
+        seq = TestShiftHandover._seq
+        svc = ShiftHandoverService()
+        values = {
+            "交接单号": f"HO-T-{seq}",
+            "交班班次": "夜班 2026-11-25 20:00-次日08:00",
+            "接班班次": "早班 2026-11-26 08:00-20:00",
+            "交班负责人": "甲",
+            "接班负责人": "乙",
+            "交班时刻": "2026-11-26T08:00:00",
+            "接班时刻": "2026-11-26T20:00:00",
+            "关联迟到记录": f"Q-{seq}",
+            "关联重跑任务": task["重跑编号"],
+        }
+        values.update(overrides)
+        entry, problems = svc.create_entry(values)
+        assert entry is not None, problems
+        task["来源交接单"] = entry["交接单号"]
+        return svc, entry
+
+    def test_create_starts_delivered(self):
+        task = self._new_task()
+        svc, entry = self._new_ticket(task)
+        assert entry["status"] == "已送交"
+        assert entry["pending"] is True
+        assert entry["经手人"] == "甲"
+        assert entry["签收时间"] == ""
+
+    def test_create_rejects_duplicate_and_same_person(self):
+        task = self._new_task()
+        svc, entry = self._new_ticket(task)
+        dup, problems = svc.create_entry({**{
+            "交接单号": entry["交接单号"], "交班班次": "夜班", "接班班次": "早班",
+            "交班负责人": "甲", "接班负责人": "乙",
+        }})
+        assert dup is None and any("已存在" in p for p in problems)
+        same, problems = svc.create_entry({
+            "交接单号": "HO-T-SAME", "交班班次": "夜班", "接班班次": "早班",
+            "交班负责人": "甲", "接班负责人": "甲",
+        })
+        assert same is None and any("不得为同一人" in p for p in problems)
+
+    def test_sign_grants_schedule_and_syncs_conclusion(self):
+        from app.store import store
+        task = self._new_task()
+        svc, entry = self._new_ticket(task)
+        signed, msg = svc.run_action(entry["id"], "签收", actor="乙", remark="已核对")
+        assert signed is not None, msg
+        assert signed["status"] == "已签收"
+        assert signed["签收时间"]
+        assert "已签收@乙" in signed["签收结论"]
+        assert "已签收@乙" in task["交接签收"]
+        assert task["负责人"] == "乙"
+        assert task["负责班次"].startswith("早班")
+        assert svc.schedule_grant(task["重跑编号"], "乙") is not None
+        assert store.find("shift_handover", entry["id"])["status"] == "已签收"
+
+    def test_schedule_permission_requires_signed_handover(self):
+        from app.services.reprocess_task import ReprocessTaskService
+        task = self._new_task()
+        svc, entry = self._new_ticket(task)
+        rp = ReprocessTaskService()
+        blocked, msg = rp.run_action(task["id"], "排期重跑", actor="乙")
+        assert blocked is None
+        assert "排期权限" in msg
+        assert task["status"] == "待排期"
+
+        svc.run_action(entry["id"], "签收", actor="乙")
+        ok, _ = rp.run_action(task["id"], "排期重跑", actor="乙")
+        assert ok is not None
+        assert ok["status"] == "重跑中"
+        assert ok["排期依据"] == f"{entry['交接单号']}@乙"
+
+    def test_concurrent_withdraw_and_sign_only_one_wins(self):
+        task = self._new_task()
+        svc, entry = self._new_ticket(task)
+        first, m1 = svc.run_action(entry["id"], "签收", actor="乙")
+        assert first is not None, m1
+        second, m2 = svc.run_action(entry["id"], "撤回", actor="甲")
+        assert second is None
+        assert "有效处分" in m2
+        assert first["status"] == "已签收"
+        assert first["处分"] == "签收"
+        assert first["无效申请"] and first["无效申请"][0]["动作"] == "撤回"
+
+    def test_concurrent_withdraw_first_then_sign(self):
+        task = self._new_task()
+        svc, entry = self._new_ticket(task)
+        first, m1 = svc.run_action(entry["id"], "撤回", actor="甲")
+        assert first is not None, m1
+        assert first["status"] == "已撤回"
+        second, m2 = svc.run_action(entry["id"], "签收", actor="乙")
+        assert second is None
+        assert "有效处分" in m2
+        assert svc.schedule_grant(task["重跑编号"], "乙") is None
+
+    def test_reject_then_reassign_next_shift(self):
+        task = self._new_task()
+        svc, entry = self._new_ticket(task)
+        rejected, msg = svc.run_action(entry["id"], "拒收", actor="乙", remark="交接不清")
+        assert rejected is not None, msg
+        assert rejected["status"] == "已拒收"
+        assert "已拒收@乙" in rejected["签收结论"]
+
+        reassigned, msg = svc.run_action(
+            entry["id"], "改派", actor="乙", target="丙", remark="交给晚班")
+        assert reassigned is not None, msg
+        assert reassigned["status"] == "已送交"
+        assert reassigned["接班负责人"] == "丙"
+        assert reassigned["原接班负责人"] == "乙"
+        assert reassigned["处分"] == ""
+        assert reassigned["轮次"] == 2
+        assert task["交接签收"].startswith("由 乙 改派给 丙")
+
+        assert svc.schedule_grant(task["重跑编号"], "丙") is None
+        signed, msg = svc.run_action(entry["id"], "签收", actor="丙")
+        assert signed is not None, msg
+        assert task["负责人"] == "丙"
+        assert svc.schedule_grant(task["重跑编号"], "丙") is not None
+
+    def test_reassign_only_after_reject_or_withdraw(self):
+        task = self._new_task()
+        svc, entry = self._new_ticket(task)
+        blocked, msg = svc.run_action(entry["id"], "改派", actor="乙", target="丙")
+        assert blocked is None
+        assert "仅已拒收或已撤回" in msg
+        svc.run_action(entry["id"], "拒收", actor="乙")
+        same, msg = svc.run_action(entry["id"], "改派", actor="乙", target="乙")
+        assert same is None
+        assert "不得与原接班人" in msg
+
+    def test_reassign_requires_the_operator_who_closed_the_round(self):
+        task = self._new_task()
+        svc, entry = self._new_ticket(task)
+        svc.run_action(entry["id"], "拒收", actor="乙")
+        blocked, msg = svc.run_action(entry["id"], "改派", actor="丙", target="丁")
+        assert blocked is None
+        assert "接班负责人 乙" in msg
+
+        withdrawn = self._new_task()
+        svc2, entry2 = self._new_ticket(withdrawn)
+        svc2.run_action(entry2["id"], "撤回", actor="甲")
+        blocked, msg = svc2.run_action(entry2["id"], "改派", actor="乙", target="丙")
+        assert blocked is None
+        assert "交班负责人 甲" in msg
+        ok, msg = svc2.run_action(entry2["id"], "改派", actor="甲", target="丙")
+        assert ok is not None, msg
+        assert ok["status"] == "已送交"
+        assert ok["轮次"] == 2
+
+    def test_reprocess_schedule_fills_owner_and_shift(self):
+        from app.services.reprocess_task import ReprocessTaskService
+        task = self._new_task()
+        svc, entry = self._new_ticket(task)
+        svc.run_action(entry["id"], "签收", actor="乙")
+        rp = ReprocessTaskService()
+        ok, _ = rp.run_action(task["id"], "排期重跑", actor="乙")
+        assert ok is not None
+        assert ok["负责人"] == "乙"
+        assert ok["负责班次"].startswith("早班")
+
+    def test_started_work_stays_in_original_shift(self):
+        task = self._new_task(status="重跑中", owner="甲")
+        svc, entry = self._new_ticket(task)
+        signed, msg = svc.run_action(entry["id"], "签收", actor="乙")
+        assert signed is not None, msg
+        assert "已启动" in signed["保留工作"]
+        assert task["负责人"] == "甲"
+        assert task["负责班次"].startswith("夜班")
+
+    def test_actor_must_match_role(self):
+        task = self._new_task()
+        svc, entry = self._new_ticket(task)
+        assert svc.run_action(entry["id"], "签收", actor="甲")[0] is None
+        assert svc.run_action(entry["id"], "撤回", actor="乙")[0] is None
+        assert svc.run_action(entry["id"], "签收")[0] is None
+        assert svc.run_action(entry["id"], "不存在的动作", actor="乙")[0] is None
+
+    def test_verify_shift_by_record_and_time(self):
+        task = self._new_task()
+        svc, entry = self._new_ticket(task)
+        result = svc.verify(record_id=entry["关联迟到记录"])
+        assert result["ok"]
+        assert result["交班负责人"] == "甲"
+        assert result["可核实"] is False  # 尚未签收
+        by_time = svc.verify(at="2026-11-26T09:00:00")
+        assert by_time["ok"]
+        assert any(t["交接单号"] == entry["交接单号"] for t in by_time["tickets"])
+        assert svc.verify(record_id="NOT-EXIST")["ok"] is False
+
+        svc.run_action(entry["id"], "签收", actor="乙")
+        assert svc.verify(record_id=entry["关联迟到记录"])["可核实"] is True
+
+    def test_seed_has_q1_q2_handovers(self):
+        from app.store import store
+        late = {r.get("记录编号"): r for r in store.rows("late_fact")}
+        assert "Q1" in late and "Q2" in late
+        assert late["Q1"]["关联交接单"] == "HO-001"
+        assert late["Q2"]["关联交接单"] == "HO-002"
+        tickets = {t.get("关联迟到记录"): t for t in store.rows("shift_handover")}
+        assert tickets["Q1"]["关联重跑任务"] == "RP-Q1"
+        assert tickets["Q2"]["关联重跑任务"] == "RP-Q2"
+        assert tickets["Q1"]["status"] == "已送交"
+        task_ids = {r.get("重跑编号") for r in store.rows("reprocess_task")}
+        assert {"RP-Q1", "RP-Q2"} <= task_ids
+
+    def test_concurrent_threads_produce_single_disposition(self):
+        import threading
+        from app.services.shift_handover import ShiftHandoverService
+        from app.store import store
+        task = self._new_task()
+        svc, entry = self._new_ticket(task)
+        results: list[tuple[dict | None, str]] = []
+
+        def fire(action: str, actor: str) -> None:
+            results.append(ShiftHandoverService().run_action(entry["id"], action, actor=actor))
+
+        threads = [
+            threading.Thread(target=fire, args=("签收", "乙")),
+            threading.Thread(target=fire, args=("撤回", "甲")),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        winners = [r for r in results if r[0] is not None]
+        losers = [r for r in results if r[0] is None]
+        assert len(winners) == 1
+        assert len(losers) == 1
+        ticket = store.find("shift_handover", entry["id"])
+        assert ticket["处分"] in ("签收", "撤回")
+        assert len(ticket["无效申请"]) == 1

@@ -41,6 +41,20 @@ def list_entries(
     return PageResult(items=items, total=total, page=page, size=size)
 
 
+@router.get("/{module}/verify")
+def verify_entries(
+    module: str, request: Request,
+    record_id: str | None = Query(default=None),
+    at: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """交班核实：按迟到记录或时刻查交接单上的交班时刻与负责人。"""
+    service = require_service(module)
+    verifier = getattr(service, "verify", None)
+    if verifier is None:
+        raise HTTPException(status_code=400, detail=f"{module} 不支持交班核实")
+    return verifier(record_id=record_id, at=at)
+
+
 @router.get("/{module}/export")
 def export_entries(
     module: str,
@@ -85,14 +99,20 @@ def get_entry(module: str, entry_id: int) -> dict[str, Any]:
 @router.post("/{module}", response_model=ActionResult)
 def create_entry(module: str, payload: EntryPayload) -> ActionResult:
     service = require_service(module)
-    entry, missing = service.create_entry(payload.values)
-    if missing:
-        return ActionResult(ok=False, message=f"缺少必填字段：{'、'.join(missing)}")
+    entry, problems = service.create_entry(payload.values)
+    if problems:
+        missing = [item for item in problems if item in service.REQUIRED_FIELDS]
+        if missing:
+            return ActionResult(ok=False, message=f"缺少必填字段：{'、'.join(missing)}")
+        return ActionResult(ok=False, message="；".join(problems))
     return ActionResult(ok=True, message=f"{service.ENTITY}已登记", entry=entry)
 
 
 @router.post("/{module}/{entry_id}/actions", response_model=ActionResult)
 def run_action(module: str, entry_id: int, payload: ActionPayload) -> ActionResult:
     service = require_service(module)
-    entry, message = service.run_action(entry_id, payload.action.strip())
+    entry, message = service.run_action(
+        entry_id, payload.action.strip(),
+        remark=payload.remark, actor=payload.actor, target=payload.target,
+    )
     return ActionResult(ok=entry is not None, message=message, entry=entry)

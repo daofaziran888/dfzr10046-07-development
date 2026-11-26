@@ -24,6 +24,7 @@ from app.services.lineage_edge import LineageEdgeService
 from app.services.dim_publish import DimPublishService
 from app.services.model_audit import ModelAuditService
 from app.services.src_extract import SrcExtractService
+from app.services.shift_handover import ShiftHandoverService
 
 SERVICES: dict[str, BaseModuleService] = {
     "dim_entry": DimEntryService(),
@@ -48,6 +49,7 @@ SERVICES: dict[str, BaseModuleService] = {
     "dim_publish": DimPublishService(),
     "model_audit": ModelAuditService(),
     "src_extract": SrcExtractService(),
+    "shift_handover": ShiftHandoverService(),
 }
 
 

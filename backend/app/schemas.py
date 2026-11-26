@@ -29,3 +29,6 @@ class EntryPayload(BaseModel):
 class ActionPayload(BaseModel):
     action: str
     remark: str | None = None
+    # 经手人 / 改派目标：交接签收与排期权限需要知道是谁在操作、要交给谁。
+    actor: str | None = None
+    target: str | None = None
